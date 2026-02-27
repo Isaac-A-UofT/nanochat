@@ -538,7 +538,7 @@ def main(picochat: bool = False) -> None:
     if picochat:
         depth = 12
         num_shards = 40
-        device_batch_size = 32
+        device_batch_size = DEVICE_BATCH_SIZE
         wandb_run = "dummy"
         mode_label = "PICOCHAT (d12, 40 shards)"
     else:
