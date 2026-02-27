@@ -1,7 +1,7 @@
 """
 GPT model (rewrite, a lot simpler)
 Notable features:
-- rotary embeddings (and no positional embeddings)
+- ALiBi positional biases (no positional embeddings)
 - QK norm
 - untied weights for token embedding and lm_head
 - relu^2 activation in MLP
@@ -48,14 +48,6 @@ def has_ve(layer_idx, n_layer):
     """Returns True if GPT layer should have Value Embedding (alternating, last layer always included)."""
     return layer_idx % 2 == (n_layer - 1) % 2
 
-def apply_rotary_emb(x, cos, sin):
-    assert x.ndim == 4  # multihead attention
-    d = x.shape[3] // 2
-    x1, x2 = x[..., :d], x[..., d:] # split up last dim into two halves
-    y1 = x1 * cos + x2 * sin # rotate pairs of dims
-    y2 = x1 * (-sin) + x2 * cos
-    return torch.cat([y1, y2], 3)
-
 class CausalSelfAttention(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
@@ -73,7 +65,7 @@ class CausalSelfAttention(nn.Module):
         self.ve_gate_channels = 32
         self.ve_gate = nn.Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
 
-    def forward(self, x, ve, cos_sin, window_size, kv_cache):
+    def forward(self, x, ve, alibi_slopes, window_size, kv_cache):
         B, T, C = x.size()
 
         # Project the input to get queries, keys, and values
@@ -88,16 +80,14 @@ class CausalSelfAttention(nn.Module):
             gate = 2 * torch.sigmoid(self.ve_gate(x[..., :self.ve_gate_channels]))  # (B, T, n_kv_head), range (0, 2)
             v = v + gate.unsqueeze(-1) * ve
 
-        # Apply Rotary Embeddings to queries and keys to get relative positional encoding
-        cos, sin = cos_sin
-        q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
-        q, k = norm(q), norm(k) # QK norm
+        # QK norm (no rotary -- ALiBi provides positional information via attention biases)
+        q, k = norm(q), norm(k)
 
-        # Flash Attention (FA3 on Hopper+, PyTorch SDPA fallback elsewhere)
+        # Flash Attention with ALiBi biases (FA3 on Hopper+, PyTorch SDPA fallback elsewhere)
         # window_size is (left, right) tuple: (N, 0) for causal, (-1, 0) for full context
         if kv_cache is None:
             # Training: causal attention with optional sliding window
-            y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+            y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size, alibi_slopes=alibi_slopes)
         else:
             # Inference: use flash_attn_with_kvcache which handles cache management
             k_cache, v_cache = kv_cache.get_layer_cache(self.layer_idx)
@@ -107,6 +97,7 @@ class CausalSelfAttention(nn.Module):
                 cache_seqlens=kv_cache.cache_seqlens,
                 causal=True,
                 window_size=window_size,
+                alibi_slopes=alibi_slopes,
             )
             # Advance position after last layer processes
             if self.layer_idx == kv_cache.n_layers - 1:
@@ -137,8 +128,8 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(config, layer_idx)
         self.mlp = MLP(config)
 
-    def forward(self, x, ve, cos_sin, window_size, kv_cache):
-        x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache)
+    def forward(self, x, ve, alibi_slopes, window_size, kv_cache):
+        x = x + self.attn(norm(x), ve, alibi_slopes, window_size, kv_cache)
         x = x + self.mlp(norm(x))
         return x
 
@@ -175,15 +166,11 @@ class GPT(nn.Module):
         head_dim = config.n_embd // config.n_head
         kv_dim = config.n_kv_head * head_dim
         self.value_embeds = nn.ModuleDict({str(i): nn.Embedding(padded_vocab_size, kv_dim) for i in range(config.n_layer) if has_ve(i, config.n_layer)})
-        # To support meta device initialization, we init the rotary embeddings here, but it's just "fake" meta tensors only.
-        # As for rotary_seq_len, these rotary embeddings are pretty small/cheap in memory,
-        # so let's just over-compute them by 10X, but assert fail if we ever reach that amount.
-        # In the future we can dynamically grow the cache, for now it's fine.
-        self.rotary_seq_len = config.sequence_len * 10 # 10X over-compute should be enough, TODO make nicer?
-        head_dim = config.n_embd // config.n_head
-        cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
-        self.register_buffer("cos", cos, persistent=False) # persistent=False means it's not saved to the checkpoint
-        self.register_buffer("sin", sin, persistent=False)
+        # ALiBi: precompute per-head slopes (no learnable params, no positional embeddings)
+        # Each head gets a different slope in a geometric sequence, creating varied attention ranges.
+        # Ref: https://arxiv.org/abs/2108.12409 (Press et al., "Train Short, Test Long")
+        alibi_slopes = self._compute_alibi_slopes(config.n_head)
+        self.register_buffer("alibi_slopes", alibi_slopes, persistent=False)
 
     @torch.no_grad()
     def init_weights(self):
@@ -229,10 +216,8 @@ class GPT(nn.Module):
             if block.attn.ve_gate is not None:
                 torch.nn.init.zeros_(block.attn.ve_gate.weight)
 
-        # Rotary embeddings
-        head_dim = self.config.n_embd // self.config.n_head
-        cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
-        self.cos, self.sin = cos, sin
+        # ALiBi slopes (recompute on correct device after init_weights moves model)
+        self.alibi_slopes = self._compute_alibi_slopes(self.config.n_head).to(self.transformer.wte.weight.device)
 
         # Cast embeddings to bf16: optimizer can tolerate it and it saves memory
         if self.transformer.wte.weight.device.type == "cuda":
@@ -240,22 +225,19 @@ class GPT(nn.Module):
             for ve in self.value_embeds.values():
                 ve.to(dtype=torch.bfloat16)
 
-    def _precompute_rotary_embeddings(self, seq_len, head_dim, base=10000, device=None):
-        # TODO: bump base theta more? e.g. 100K is more common more recently
-        # autodetect the device from model embeddings
-        if device is None:
-            device = self.transformer.wte.weight.device
-        # stride the channels
-        channel_range = torch.arange(0, head_dim, 2, dtype=torch.float32, device=device)
-        inv_freq = 1.0 / (base ** (channel_range / head_dim))
-        # stride the time steps
-        t = torch.arange(seq_len, dtype=torch.float32, device=device)
-        # calculate the rotation frequencies at each (time, channel) pair
-        freqs = torch.outer(t, inv_freq)
-        cos, sin = freqs.cos(), freqs.sin()
-        cos, sin = cos.bfloat16(), sin.bfloat16() # keep them in bfloat16
-        cos, sin = cos[None, :, None, :], sin[None, :, None, :] # add batch and head dims for later broadcasting
-        return cos, sin
+    @staticmethod
+    def _compute_alibi_slopes(n_heads):
+        """
+        Compute ALiBi per-head slopes as a geometric sequence.
+
+        For n heads, the slopes are: 2^(-8 * i / n) for i in 1..n
+        This gives each head a different "decay rate" — early heads attend
+        broadly (shallow slope), later heads attend locally (steep slope).
+        Ref: https://arxiv.org/abs/2108.12409
+        """
+        ratio = 2 ** (-8.0 / n_heads)
+        slopes = torch.tensor([ratio ** (i + 1) for i in range(n_heads)], dtype=torch.float32)
+        return slopes
 
     def _compute_window_sizes(self, config):
         """
@@ -388,14 +370,6 @@ class GPT(nn.Module):
     def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean'):
         B, T = idx.size()
 
-        # Grab the rotary embeddings for the current sequence length (they are of shape (1, seq_len, 1, head_dim/2))
-        assert T <= self.cos.size(1), f"Sequence length grew beyond the rotary embeddings cache: {T} > {self.cos.size(1)}"
-        assert idx.device == self.cos.device, f"Rotary embeddings and idx are on different devices: {idx.device} != {self.cos.device}"
-        assert self.cos.dtype == torch.bfloat16, "Rotary embeddings must be in bfloat16"
-        # if kv cache exists, we need to offset the rotary embeddings to the current position in the cache
-        T0 = 0 if kv_cache is None else kv_cache.get_pos()
-        cos_sin = self.cos[:, T0:T0+T], self.sin[:, T0:T0+T] # truncate cache to current sequence length
-
         # Forward the trunk of the Transformer
         x = self.transformer.wte(idx) # embed current token
         x = norm(x)
@@ -403,7 +377,7 @@ class GPT(nn.Module):
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
-            x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
+            x = block(x, ve, self.alibi_slopes, self.window_sizes[i], kv_cache)
         x = norm(x)
 
         # Forward the lm_head (compute logits)
