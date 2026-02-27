@@ -551,6 +551,7 @@ def main(picochat: bool = False) -> None:
     w = 64
     print("\n" + "=" * w)
     print(f"nanochat Speedrun -- Modal Edition  [{mode_label}]")
+    print(f"  Branch: exp/swiglu-activation (SwiGLU MLP instead of relu²)")
     print(f"  Mirrors: runs/speedrun.sh")
     print(f"  depth={depth}  shards={num_shards}  gpu={GPU_PRETRAIN}  wandb={wandb_run}")
     print("=" * w + "\n")

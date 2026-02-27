@@ -4,7 +4,7 @@ Notable features:
 - rotary embeddings (and no positional embeddings)
 - QK norm
 - untied weights for token embedding and lm_head
-- relu^2 activation in MLP
+- SwiGLU activation in MLP (gated linear unit with SiLU/swish)
 - norm after token embedding
 - no learnable params in rmsnorm
 - no bias in linear layers
@@ -121,12 +121,18 @@ class CausalSelfAttention(nn.Module):
 class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd, bias=False)
-        self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=False)
+        # SwiGLU: uses 3 matrices instead of 2, so we reduce hidden dim
+        # from 4*n_embd to (8/3)*n_embd (rounded up to multiple of 64)
+        # to keep total parameter count roughly the same as relu^2.
+        hidden_dim = int(8 * config.n_embd / 3)
+        hidden_dim = ((hidden_dim + 63) // 64) * 64  # round to multiple of 64 for tensor core efficiency
+        self.c_fc = nn.Linear(config.n_embd, hidden_dim, bias=False)    # value path
+        self.c_gate = nn.Linear(config.n_embd, hidden_dim, bias=False)  # gate path
+        self.c_proj = nn.Linear(hidden_dim, config.n_embd, bias=False)
 
     def forward(self, x):
-        x = self.c_fc(x)
-        x = F.relu(x).square()
+        # SwiGLU: gate(x) * value(x), where gate uses SiLU (swish) activation
+        x = F.silu(self.c_gate(x)) * self.c_fc(x)
         x = self.c_proj(x)
         return x
 
@@ -214,6 +220,7 @@ class GPT(nn.Module):
             torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
             torch.nn.init.zeros_(block.attn.c_proj.weight) # projections are zero
             torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
+            torch.nn.init.uniform_(block.mlp.c_gate.weight, -s, s)  # SwiGLU gate
             torch.nn.init.zeros_(block.mlp.c_proj.weight)
 
         # Per-layer scalars
