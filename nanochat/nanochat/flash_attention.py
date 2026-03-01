@@ -45,8 +45,14 @@ HAS_FA3 = _fa3 is not None
 _override_impl = None
 
 
-def _use_fa3():
-    """Determine whether to use FA3 based on availability and override."""
+def _use_fa3(alibi_slopes=None):
+    """Determine whether to use FA3 based on availability and override.
+
+    FA3 does not support ALiBi biases — fall back to SDPA when alibi_slopes
+    is provided, even on Hopper GPUs where FA3 is otherwise available.
+    """
+    if alibi_slopes is not None:
+        return False  # ALiBi requires explicit bias matrix; only SDPA supports this
     if _override_impl == 'fa3':
         assert HAS_FA3, "Cannot override to FA3: not available on this hardware"
         return True
@@ -125,7 +131,7 @@ def flash_attn_func(q, k, v, causal=False, window_size=(-1, -1), alibi_slopes=No
     Returns:
         Output tensor of shape (B, T, H, D)
     """
-    if _use_fa3():
+    if _use_fa3(alibi_slopes=alibi_slopes):
         return _fa3.flash_attn_func(q, k, v, causal=causal, window_size=window_size, alibi_slopes=alibi_slopes)
 
     # SDPA fallback: transpose (B, T, H, D) -> (B, H, T, D)
@@ -156,7 +162,7 @@ def flash_attn_with_kvcache(q, k_cache, v_cache, k=None, v=None, cache_seqlens=N
     Returns:
         Output tensor of shape (B, T_new, H, D)
     """
-    if _use_fa3():
+    if _use_fa3(alibi_slopes=alibi_slopes):
         return _fa3.flash_attn_with_kvcache(
             q, k_cache, v_cache, k=k, v=v, cache_seqlens=cache_seqlens,
             causal=causal, window_size=window_size, alibi_slopes=alibi_slopes
