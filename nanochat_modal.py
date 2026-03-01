@@ -42,19 +42,19 @@ from modal import App, Image as ModalImage, Volume, Secret
 #   d24  ~768M params   3 hr on 8xH100     
 #   d26  ~1B params     6 hr on 8xH100 
 #   d32  ~1.9B params   41 hr on 8xH100
-DEPTH = 24
+DEPTH = 12
 
 # ── Data shards ───────────────────────────────────────────────────────────────
 # FineWeb-EDU is split into 1822 parquet shards, each ~250M chars / ~100MB.
 # 240 shards is enough for d24. Use 450 for d26 and 800 for d32.
-NUM_SHARDS = 240
+NUM_SHARDS = 40
 
 # ── GPU configuration ─────────────────────────────────────────────────────────
 # "H100:8" = 8 H100s, the reference configuration for the speedrun leaderboard.
 # "H100:4" = 4 H100s, half the speed, same cost per GPU-hour.
 # "A100:8" = 8 A100 80GBs, ~10-20% slower than H100s but sometimes cheaper.
 # Single GPU works too — code auto-compensates with gradient accumulation.
-GPU_PRETRAIN = "H100:8"
+GPU_PRETRAIN = "H100:4"
 GPU_FINETUNE = "H100:4"   # SFT and RL don't need all 8 GPUs
 
 # ── Device batch size ─────────────────────────────────────────────────────────
@@ -65,11 +65,11 @@ GPU_FINETUNE = "H100:4"   # SFT and RL don't need all 8 GPUs
 #   H100 80GB: 32 fits for d24, 16 for d26, 8 for d32
 #   A100 80GB: same as H100
 #   A100 40GB: use 16 for d24
-DEVICE_BATCH_SIZE = 16    # d24 at 16 is safe; 32 may OOM on some H100 configs
+DEVICE_BATCH_SIZE = 32    # d24 at 16 is safe; 32 may OOM on some H100 configs
 
 # ── WandB ─────────────────────────────────────────────────────────────────────
 # Set to "dummy" to disable WandB logging
-WANDB_RUN = "dummy"
+WANDB_RUN = "picochat-baseline"
 
 # ── Volume mount path ──────────────────────────────────────────────────────────
 # All cached data (shards, tokenizer, checkpoints, eval bundle) lives here
@@ -142,14 +142,12 @@ image = (
         uv_project_dir="./nanochat", 
         extra_options="--extra gpu"
     )
-    .run_commands(
-        "bash -c 'source .venv/bin/activate'"
-    )
-    # Environment variables
+    # Environment variables: NANOCHAT_BASE_DIR must point at the volume path
+    # so all stages (data, tokenizer, pretrain, ...) see the same persisted data.
     .env({
         "OMP_NUM_THREADS": "1",
-        "NANOCHAT_BASE_DIR": "/data/.cache/nanochat",
-        "HF_HOME": "/data/.cache/huggingface",
+        "NANOCHAT_BASE_DIR": "/vol/nanochat_cache",
+        "HF_HOME": "/vol/nanochat_cache/huggingface",
     })
 )
 
@@ -394,17 +392,11 @@ def stage_post_pretrain_eval() -> None:
     Evaluate the base model immediately after pretraining.
 
     speedrun.sh:
-        torchrun ... -m scripts.base_loss
         torchrun ... -m scripts.base_eval
 
-    scripts.base_loss  -- computes val_bpb (validation bits per byte) on a
-        large chunk of held-out data. Lower is better. A successful d24 run
-        gets ~0.748. Results are written to the markdown report.
-
-    scripts.base_eval  -- runs the CORE metric: zero-shot evaluation across
-        22 diverse benchmarks from the DCLM paper (HellaSwag, ARC, BoolQ,
-        LAMBADA, TriviaQA, ...). The target is 0.256525 (GPT-2's score).
-        A successful d24 speedrun hits ~0.258-0.260. Takes ~20-40 min.
+    scripts.base_eval  -- runs CORE (22 benchmarks), val bpb, and samples.
+        Default --eval core,bpb,sample. A successful d24 gets val_bpb ~0.748
+        and CORE ~0.258-0.260. Takes ~20-40 min.
 
     The eval bundle (benchmark data files, ~1GB) is downloaded on first run
     and cached in the volume for subsequent runs.
@@ -422,12 +414,8 @@ def stage_post_pretrain_eval() -> None:
         _run(f"unzip -q {zip_path} -d {NANOCHAT_CACHE} && rm {zip_path}")
         volume.commit()
 
-    # speedrun.sh: torchrun ... -m scripts.base_loss
-    print("Computing bits-per-byte on train/val data...")
-    _torchrun("scripts.base_loss", nproc=_N_PRETRAIN_GPUS)
-
-    # speedrun.sh: torchrun ... -m scripts.base_eval
-    print("Running CORE evaluation (22 benchmarks, ~20-40 min)...")
+    # speedrun.sh: torchrun ... -m scripts.base_eval (runs core + bpb + samples)
+    print("Running base_eval (CORE, bpb, samples)...")
     _torchrun("scripts.base_eval", nproc=_N_PRETRAIN_GPUS)
 
     volume.commit()
@@ -538,8 +526,8 @@ def main(picochat: bool = False) -> None:
     if picochat:
         depth = 12
         num_shards = 40
-        device_batch_size = DEVICE_BATCH_SIZE
-        wandb_run = "dummy"
+        device_batch_size = 32
+        wandb_run = WANDB_RUN
         mode_label = "PICOCHAT (d12, 40 shards)"
     else:
         depth = DEPTH
